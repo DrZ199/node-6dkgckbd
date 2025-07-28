@@ -48,6 +48,215 @@ CREATE TABLE IF NOT EXISTS pediatric_drug_dosages (
     min_age_months INTEGER,
     max_age_months INTEGER,
     frequency TEXT NOT NULL,
+    contraindications TEXT[],
+    side_effects TEXT[],
+    monitoring_requirements TEXT[],
+    pregnancy_category TEXT,
+    lactation_safety TEXT,
+    tags TEXT[] DEFAULT '{}',
+    embedding vector(384),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- User roles and permissions table
+CREATE TABLE IF NOT EXISTS user_roles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    name TEXT NOT NULL CHECK (name IN ('physician', 'nurse', 'resident', 'student', 'admin')),
+    permissions TEXT[] DEFAULT '{}',
+    institution TEXT,
+    department TEXT,
+    granted_by UUID,
+    granted_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Security audit log table (HIPAA compliance)
+CREATE TABLE IF NOT EXISTS security_audit_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type TEXT NOT NULL,
+    user_id UUID,
+    event_data JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    session_id TEXT,
+    outcome TEXT CHECK (outcome IN ('success', 'failure', 'warning')),
+    risk_level TEXT CHECK (risk_level IN ('low', 'medium', 'high', 'critical'))
+);
+
+-- Chat sessions table with HIPAA compliance
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    title TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    last_accessed TIMESTAMPTZ DEFAULT NOW(),
+    message_count INTEGER DEFAULT 0,
+    is_archived BOOLEAN DEFAULT FALSE,
+    retention_until TIMESTAMPTZ, -- HIPAA 7-year retention
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+-- Chat messages table with encryption support
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content_encrypted TEXT NOT NULL, -- Encrypted content
+    content_hash TEXT NOT NULL, -- Hash for integrity verification
+    citations JSONB DEFAULT '[]'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    query_type TEXT, -- For analytics
+    response_time_ms INTEGER,
+    token_count INTEGER
+);
+
+-- Data retention tracking (HIPAA compliance)
+CREATE TABLE IF NOT EXISTS data_retention (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    table_name TEXT NOT NULL,
+    record_id UUID NOT NULL,
+    retention_category TEXT NOT NULL CHECK (retention_category IN ('medical_query', 'user_data', 'audit_log', 'session_data')),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    retention_until TIMESTAMPTZ NOT NULL,
+    destruction_scheduled TIMESTAMPTZ,
+    destruction_completed TIMESTAMPTZ,
+    destruction_method TEXT,
+    legal_hold BOOLEAN DEFAULT FALSE,
+    notes TEXT
+);
+
+-- HIPAA training records
+CREATE TABLE IF NOT EXISTS hipaa_training_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    training_date TIMESTAMPTZ NOT NULL,
+    training_type TEXT NOT NULL,
+    completion_status TEXT CHECK (completion_status IN ('completed', 'in_progress', 'expired')),
+    certificate_number TEXT,
+    expiry_date TIMESTAMPTZ,
+    training_provider TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Consent and agreements table
+CREATE TABLE IF NOT EXISTS user_consents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    consent_type TEXT NOT NULL CHECK (consent_type IN ('terms_of_service', 'privacy_policy', 'hipaa_notice', 'data_processing')),
+    consent_version TEXT NOT NULL,
+    consent_date TIMESTAMPTZ DEFAULT NOW(),
+    withdrawn_date TIMESTAMPTZ,
+    ip_address INET,
+    user_agent TEXT,
+    consent_text TEXT NOT NULL
+);
+
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_nelson_book_embedding ON nelson_book_of_pediatrics USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_pediatric_resource_embedding ON pediatric_medical_resource USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_drug_dosages_embedding ON pediatric_drug_dosages USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_security_audit_timestamp ON security_audit_log (timestamp);
+CREATE INDEX IF NOT EXISTS idx_security_audit_user ON security_audit_log (user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages (session_id);
+CREATE INDEX IF NOT EXISTS idx_data_retention_due ON data_retention (retention_until) WHERE destruction_completed IS NULL;
+
+-- Stored procedures for medical content search
+CREATE OR REPLACE FUNCTION search_medical_content(
+    query_embedding vector(384),
+    match_count int DEFAULT 5,
+    similarity_threshold float DEFAULT 0.7
+)
+RETURNS TABLE (
+    id uuid,
+    title text,
+    content text,
+    chapter text,
+    page integer,
+    tags text[],
+    similarity float,
+    updated_at timestamptz
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT 
+        n.id,
+        n.title,
+        n.content,
+        n.chapter,
+        n.page,
+        n.tags,
+        1 - (n.embedding <=> query_embedding) as similarity,
+        n.updated_at
+    FROM nelson_book_of_pediatrics n
+    WHERE 1 - (n.embedding <=> query_embedding) > similarity_threshold
+    ORDER BY n.embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+-- Stored procedure for drug dosage search
+CREATE OR REPLACE FUNCTION search_drug_dosages(
+    query_embedding vector(384),
+    match_count int DEFAULT 5,
+    similarity_threshold float DEFAULT 0.7
+)
+RETURNS TABLE (
+    id uuid,
+    drug_name text,
+    indication text,
+    route text,
+    dose_per_kg decimal,
+    max_dose decimal,
+    frequency text,
+    contraindications text[],
+    similarity float
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT 
+        d.id,
+        d.drug_name,
+        d.indication,
+        d.route,
+        d.dose_per_kg,
+        d.max_dose,
+        d.frequency,
+        d.contraindications,
+        1 - (d.embedding <=> query_embedding) as similarity
+    FROM pediatric_drug_dosages d
+    WHERE 1 - (d.embedding <=> query_embedding) > similarity_threshold
+    ORDER BY d.embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+-- Function to automatically set retention dates
+CREATE OR REPLACE FUNCTION set_retention_date()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Set retention date to 7 years from creation (HIPAA requirement)
+    NEW.retention_until := NEW.created_at + INTERVAL '7 years';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Triggers for automatic retention date setting
+CREATE TRIGGER set_chat_session_retention
+    BEFORE INSERT ON chat_sessions
+    FOR EACH ROW
+    EXECUTE FUNCTION set_retention_date();
+
+CREATE TRIGGER set_audit_log_retention
+    BEFORE INSERT ON security_audit_log
+    FOR EACH ROW
+    EXECUTE FUNCTION set_retention_date();
     duration TEXT,
     contraindications TEXT[],
     side_effects TEXT[],

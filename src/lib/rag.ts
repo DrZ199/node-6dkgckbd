@@ -1,15 +1,30 @@
 import { supabase } from './supabase';
 import { generateResponse, createMedicalSystemPrompt, type MistralMessage } from './mistral';
 import { Citation, PediatricReference } from '../types';
+import { cacheManager } from './cache';
+import { checkMedicalQueryLimit, checkDosageCalculationLimit } from './rateLimit';
+import { logger, logMedicalQuery, logPerformance } from './logger';
+import { errorReporting, MedicalDataError } from '../components/ErrorBoundary';
 
 // HuggingFace embedding service
 const HUGGINGFACE_API_KEY = import.meta.env.VITE_HUGGINGFACE_API_KEY;
 const EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2';
 
 async function generateEmbedding(text: string): Promise<number[]> {
+  const startTime = Date.now();
+  
+  // Check cache first
+  const cachedEmbedding = await cacheManager.getEmbedding(text);
+  if (cachedEmbedding) {
+    logPerformance('Embedding cache hit', Date.now() - startTime);
+    return cachedEmbedding;
+  }
+
   if (!HUGGINGFACE_API_KEY) {
-    console.warn('HuggingFace API key not found, using mock embeddings');
-    return new Array(384).fill(0).map(() => Math.random());
+    logger.warn('HuggingFace API key not found, using mock embeddings');
+    const mockEmbedding = new Array(384).fill(0).map(() => Math.random());
+    await cacheManager.setEmbedding(text, mockEmbedding, 60 * 60); // Cache for 1 hour
+    return mockEmbedding;
   }
 
   try {
@@ -33,10 +48,20 @@ async function generateEmbedding(text: string): Promise<number[]> {
     }
 
     const embeddings = await response.json();
-    return Array.isArray(embeddings) ? embeddings : embeddings[0];
+    const embedding = Array.isArray(embeddings) ? embeddings : embeddings[0];
+    
+    // Cache the embedding
+    await cacheManager.setEmbedding(text, embedding);
+    
+    logPerformance('Embedding generation', Date.now() - startTime);
+    return embedding;
   } catch (error) {
-    console.error('Embedding generation failed:', error);
-    return new Array(384).fill(0).map(() => Math.random());
+    logger.error('Embedding generation failed:', error);
+    errorReporting.reportApiError('huggingface-embeddings', error as Error, { text: '[REDACTED]' });
+    
+    const fallbackEmbedding = new Array(384).fill(0).map(() => Math.random());
+    await cacheManager.setEmbedding(text, fallbackEmbedding, 60 * 60); // Cache fallback for 1 hour
+    return fallbackEmbedding;
   }
 }
 
@@ -77,11 +102,36 @@ export async function searchMedicalKnowledge(
 
 export async function generateMedicalResponse(
   userQuery: string,
-  conversationHistory: MistralMessage[] = []
+  conversationHistory: MistralMessage[] = [],
+  userId?: string,
+  patientContext?: any
 ): Promise<{ response: string; citations: Citation[] }> {
+  const startTime = Date.now();
+  
   try {
+    // Check rate limit
+    const canProceed = await checkMedicalQueryLimit(userQuery);
+    if (!canProceed) {
+      throw new MedicalDataError('Rate limit exceeded for medical queries', 'query');
+    }
+
+    // Check cache for similar queries
+    const cachedResponse = await cacheManager.getSearchResults(userQuery);
+    if (cachedResponse) {
+      logPerformance('Medical response cache hit', Date.now() - startTime);
+      logMedicalQuery(userQuery, userId, Date.now() - startTime);
+      return cachedResponse;
+    }
+
     // Search for relevant medical content
     const relevantContent = await searchMedicalKnowledge(userQuery);
+    
+    if (relevantContent.length === 0) {
+      logger.warn('No relevant medical content found for query', {
+        query_length: userQuery.length,
+        user_id: userId,
+      });
+    }
     
     // Create citations from retrieved content
     const citations: Citation[] = relevantContent.map(ref => ({
@@ -113,12 +163,33 @@ export async function generateMedicalResponse(
     // Generate response using Mistral
     const response = await generateResponse(messages, 0.3, 2048);
 
-    return {
+    const result = {
       response,
       citations
     };
+
+    // Cache the response
+    await cacheManager.setSearchResults(userQuery, result, 10 * 60); // Cache for 10 minutes
+
+    // Log the medical query
+    const duration = Date.now() - startTime;
+    logMedicalQuery(userQuery, userId, duration);
+    logPerformance('Medical response generation', duration);
+
+    return result;
   } catch (error) {
-    console.error('Medical response generation failed:', error);
+    const duration = Date.now() - startTime;
+    logger.error('Medical response generation failed:', error);
+    errorReporting.reportMedicalError('response_generation', error as Error, {
+      query_length: userQuery.length,
+      user_id: userId,
+      duration_ms: duration,
+    });
+
+    if (error instanceof MedicalDataError) {
+      throw error; // Re-throw medical data errors
+    }
+
     return {
       response: 'I apologize, but I encountered an error while processing your request. Please try again or contact support if the issue persists.',
       citations: []

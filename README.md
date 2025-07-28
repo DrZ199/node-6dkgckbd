@@ -194,28 +194,55 @@ The application uses a comprehensive medical database schema:
 
 ## 🧪 Testing & Development
 
-### Medical Content Testing
+### Comprehensive Testing Suite
 ```bash
-# Test RAG functionality
-bun test:rag
+# Run all tests
+bun test
 
-# Test dosage calculations
-bun test:dosage
+# Unit tests with coverage
+bun test:coverage
 
-# Test emergency protocols
-bun test:emergency
-```
+# Interactive test UI
+bun test:ui
 
-### UI/UX Testing
-```bash
-# Component testing
-bun test:components
-
-# E2E testing
+# End-to-end tests
 bun test:e2e
 
-# PWA functionality
-bun test:pwa
+# E2E tests with UI
+bun test:e2e:ui
+
+# Medical-specific tests
+bun test src/lib/__tests__/
+
+# Authentication tests
+bun test src/lib/__tests__/auth.test.ts
+```
+
+### Mobile App Development
+```bash
+# Build for mobile platforms
+bun build
+
+# Sync Capacitor
+bun mobile:sync
+
+# Run on Android
+bun mobile:android
+
+# Run on iOS
+bun mobile:ios
+```
+
+### Security & Compliance Testing
+```bash
+# Test authentication flows
+bun test:e2e auth.spec.ts
+
+# Test rate limiting
+bun test src/lib/__tests__/rateLimit.test.ts
+
+# Test HIPAA compliance features
+bun test src/lib/__tests__/hipaa.test.ts
 ```
 
 ## 📈 Performance Optimization
