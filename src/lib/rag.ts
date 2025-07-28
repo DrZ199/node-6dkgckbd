@@ -103,7 +103,8 @@ export async function searchMedicalKnowledge(
 export async function generateMedicalResponse(
   userQuery: string,
   conversationHistory: MistralMessage[] = [],
-  userId?: string
+  userId?: string,
+  patientContext?: any
 ): Promise<{ response: string; citations: Citation[] }> {
   const startTime = Date.now();
   
